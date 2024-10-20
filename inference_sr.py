@@ -10,6 +10,7 @@ from PIL import Image
 from model import ControlLDM, Diffusion, RRDBNet
 from utils.common import (instantiate_from_config, wavelet_decomposition,
                           wavelet_reconstruction)
+from utils.cond_fn import Guidance, MSEGuidance, WeightedMSEGuidance
 from utils.helpers import pad_to_multiples_of
 from utils.inference import load_model_from_url
 from utils.sampler import SpacedSampler
@@ -27,6 +28,14 @@ def parse_args() -> Namespace:
     parser.add_argument("--neg_prompt", type=str, default="low quality, blurry, low-resolution, noisy, unsharp, weird textures")
     parser.add_argument("--cfg_scale", type=float, default=4.0)
     parser.add_argument("--better_start", action="store_true")
+    ### guidance parameters
+    parser.add_argument("--guidance", action="store_true")
+    parser.add_argument("--g_loss", type=str, default="mse", choices=["mse", "w_mse"])
+    parser.add_argument("--g_scale", type=float, default=0.0)
+    parser.add_argument("--g_start", type=int, default=1001)
+    parser.add_argument("--g_stop", type=int, default=-1)
+    parser.add_argument("--g_space", type=str, default="latent")
+    parser.add_argument("--g_repeat", type=int, default=1)
     ### common parameters
     parser.add_argument("--seed", type=int, default=231)
     return parser.parse_args()
@@ -50,6 +59,12 @@ def main():
     model_stage1: RRDBNet = load_BSRNet(device)
     # Initialize stage2 model
     cldm, diffusion = load_stage2_models(device)
+    if args.guidance:
+        cond_fn = init_cond_fn(args.g_loss, args.g_scale, args.g_start, args.g_stop,
+                               args.g_space, args.g_repeat)
+    else:
+        cond_fn = None
+    print("Setup finished")
 
     # Prepare input data
     lq = image_to_tensor(lq, device)
@@ -59,7 +74,7 @@ def main():
     # Run stage2
     # utils/helpers:Pipeline:run_stage2
     hq = inference_stage2(cldm, diffusion, clean, args.steps, args.pos_prompt,
-                            args.neg_prompt, args.cfg_scale, args.better_start)
+                            args.neg_prompt, args.cfg_scale, args.better_start, cond_fn=cond_fn)
     hq = (hq + 1) * 0.5     # [-1, 1] -> [0, 1]
     print(f"stage2 output size: {(hq.shape[3], hq.shape[2])}")
 
@@ -113,6 +128,23 @@ def load_stage2_models(device) -> Tuple[ControlLDM, Diffusion]:
     diffusion.to(device)
     return cldm, diffusion
 
+def init_cond_fn(g_loss: str, g_scale: float, g_start: int, g_stop: int, g_space: int, g_repeat: int) -> Guidance:
+    if g_loss == "mse":
+        cond_fn_cls = MSEGuidance
+    elif g_loss == "w_mse":
+        cond_fn_cls = WeightedMSEGuidance
+    else:
+        raise ValueError(g_loss)
+    cond_fn: Guidance
+    cond_fn = cond_fn_cls(
+        scale=g_scale,
+        t_start=g_start,
+        t_stop=g_stop,
+        space=g_space,
+        repeat=g_repeat,
+    )
+    return cond_fn
+
 # utils/helpers:Pipeline:run_stage2
 def inference_stage2(
     cldm: ControlLDM,
@@ -124,6 +156,7 @@ def inference_stage2(
     cfg_scale: float,
     better_start: bool = False,
     strength: float = 1.0,  # utils.inference.py:InferenceLoop:run
+    cond_fn: Guidance = None,
 ) -> torch.Tensor:
 
     clean = stage1_output   # align the variable name to the original file
@@ -135,13 +168,15 @@ def inference_stage2(
     cond = cldm.prepare_condition(pad_clean, [pos_prompt] * bs)
     uncond = cldm.prepare_condition(pad_clean, [neg_prompt] * bs)
 
-    diffusion_sampler: SpacedSampler = SpacedSampler(diffusion.betas)
-
-    # TODO: set cond_fn
+    if cond_fn is not None:
+        if isinstance(cond_fn, WeightedMSEGuidance) and pad_clean.shape[1] != 3:
+            raise RuntimeError(f"latent diffusion is not compatible with g_loss=w_mse")
+        cond_fn.load_target(pad_clean * 2 - 1)
 
     old_control_scales = cldm.control_scales
     cldm.control_scales = [strength] * 13
 
+    diffusion_sampler: SpacedSampler = SpacedSampler(diffusion.betas)
     if better_start:
         # use noised low frequency parts from stage1 output as initial noise,
         # which can prevent noise in the background
@@ -167,7 +202,7 @@ def inference_stage2(
         x_T=x_T,
         progress=True,
         progress_leave=True,
-        cond_fn=None, # TODO
+        cond_fn=cond_fn,
         tiled=False,
     )
 
