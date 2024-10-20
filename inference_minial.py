@@ -7,7 +7,7 @@ import torch
 from omegaconf import OmegaConf
 from PIL import Image
 
-from model import ControlLDM, Diffusion, RRDBNet
+from model import ControlLDM, Diffusion, RRDBNet, SwinIR, SCUNet
 from utils.common import (instantiate_from_config, wavelet_decomposition,
                           wavelet_reconstruction)
 from utils.cond_fn import Guidance, MSEGuidance, WeightedMSEGuidance
@@ -18,6 +18,7 @@ from utils.sampler import SpacedSampler
 
 def parse_args() -> Namespace:
     parser = ArgumentParser()
+    parser.add_argument("--task", type=str, required=True, choices=["sr", "dn", "fr"])
     parser.add_argument("--upscale", type=float, required=True)
     ### input parameters
     parser.add_argument("-i", "--input", type=str, required=True, help="input image path")
@@ -51,12 +52,19 @@ def main():
     H, W = int(h * args.upscale), int(w * args.upscale)
     print(f"input image size: {(w, h)}")
 
-    lq_upscaled = bicubic_resize_to(lq, size=(W, H))
+    lq_upscaled = bicubic_resize_to(lq, size_wh=(W, H))
     out_folder = Path(args.output)
     out_folder.mkdir(exist_ok=True, parents=True)
 
     # Initialize stage1 model
-    model_stage1: RRDBNet = load_BSRNet(device)
+    if args.task == "sr":
+        model_stage1: RRDBNet = load_BSR(device)
+    elif args.task == "fr":
+        model_stage1: SwinIR = load_BFR(device)
+    elif args.task == "dn":
+        model_stage1: SCUNet = load_BID(device)
+    else:
+        raise NotImplementedError()
     # Initialize stage2 model
     cldm, diffusion = load_stage2_models(device)
     if args.guidance:
@@ -69,7 +77,14 @@ def main():
     # Prepare input data
     lq = image_to_tensor(lq, device)
     # Run stage1
-    clean = model_stage1(lq)
+    if args.task == "sr":
+        clean = inference_BSR(model_stage1, lq)
+    elif args.task == "fr":
+        clean = inference_BFR(model_stage1, lq, size_hw=(H, W))
+    elif args.task == "dn":
+        clean = inference_BID(model_stage1, lq, size_hw=(H, W))
+    else:
+        raise RuntimeError()
     print(f"stage1 output size: {(clean.shape[3], clean.shape[2])}")
     # Run stage2
     # utils/helpers:Pipeline:run_stage2
@@ -81,14 +96,14 @@ def main():
     # Postproces: correct color
     out = wavelet_reconstruction(hq, clean)
     out = tensor_to_image(out)
-    out = bicubic_resize_to(out, size=(W, H))
+    out = bicubic_resize_to(out, size_wh=(W, H))
     print(f"output size: {(out.shape[1], out.shape[0])}")
 
     # Save outputs
     out_stage1 = tensor_to_image(clean)
-    out_stage1 = bicubic_resize_to(out_stage1, size=(W, H))
+    out_stage1 = bicubic_resize_to(out_stage1, size_wh=(W, H))
     out_stage2 = tensor_to_image(hq)
-    out_stage2 = bicubic_resize_to(out_stage2, size=(W, H))
+    out_stage2 = bicubic_resize_to(out_stage2, size_wh=(W, H))
     vis = np.concatenate([
         np.concatenate([lq_upscaled, out_stage1], 1),
         np.concatenate([out_stage2, out], 1),
@@ -99,18 +114,48 @@ def main():
 MODELS = {
     ### stage_1 model weights
     "bsrnet": "https://github.com/cszn/KAIR/releases/download/v1.0/BSRNet.pth",
+    "swinir_face": "https://huggingface.co/lxq007/DiffBIR/resolve/main/face_swinir_v1.ckpt",
+    "scunet_psnr": "https://github.com/cszn/KAIR/releases/download/v1.0/scunet_color_real_psnr.pth",
     ### stage_2 model weights
     "sd_v21": "https://huggingface.co/stabilityai/stable-diffusion-2-1-base/resolve/main/v2-1_512-ema-pruned.ckpt",
     "v2": "https://huggingface.co/lxq007/DiffBIR-v2/resolve/main/v2.pth"
 }
 
 # utils/inference.py:BSRInferenceLoop:init_stage1_model
-def load_BSRNet(device) -> RRDBNet:
+def load_BSR(device) -> RRDBNet:
     model: RRDBNet = instantiate_from_config(OmegaConf.load("configs/inference/bsrnet.yaml"))
     weights = load_model_from_url(MODELS["bsrnet"])
     model.load_state_dict(weights, strict=True)
     model.eval().to(device)
     return model
+
+def load_BFR(device) -> SwinIR:
+    model: SwinIR = instantiate_from_config(OmegaConf.load("configs/inference/swinir.yaml"))
+    weights = load_model_from_url(MODELS["swinir_face"])
+    model.load_state_dict(weights, strict=True)
+    model.eval().to(device)
+    return model
+
+def load_BID(device) -> SCUNet:
+    model: SCUNet = instantiate_from_config(OmegaConf.load("configs/inference/scunet.yaml"))
+    weights = load_model_from_url(MODELS["scunet_psnr"])
+    model.load_state_dict(weights, strict=True)
+    model.eval().to(device)
+    return model
+
+def inference_BSR(bsr_model: RRDBNet, lq: torch.Tensor) -> torch.Tensor:
+    clean = bsr_model(lq)
+    return clean
+
+def inference_BFR(bfr_model: RRDBNet, lq: torch.Tensor, size_hw: Tuple[int, int]) -> torch.Tensor:
+    lq = torch.nn.functional.interpolate(lq, size=size_hw)
+    clean = bfr_model(lq)
+    return clean
+
+def inference_BID(bid_model: SCUNet, lq: torch.Tensor, size_hw: Tuple[int, int]) -> torch.Tensor:
+    lq = torch.nn.functional.interpolate(lq, size=size_hw)
+    clean = bid_model(lq)
+    return clean
 
 # utils/inference.py:InferenceLoop:init_stage2_model
 def load_stage2_models(device) -> Tuple[ControlLDM, Diffusion]:
@@ -212,12 +257,12 @@ def inference_stage2(
     cldm.control_scales = old_control_scales
     return x
 
-def bicubic_resize_to(img: np.ndarray, size: Tuple[int, int] = None, scale: float = None) -> np.ndarray:
+def bicubic_resize_to(img: np.ndarray, size_wh: Tuple[int, int] = None, scale: float = None) -> np.ndarray:
     pil = Image.fromarray(img)
-    if size is None:
+    if size_wh is None:
         res = pil.resize(tuple(int(x * scale) for x in pil.size), Image.BICUBIC)
     else:
-        res = pil.resize(size, Image.BICUBIC)
+        res = pil.resize(size_wh, Image.BICUBIC)
     return np.array(res)
 
 def image_to_tensor(image: np.ndarray, device) -> torch.Tensor:
