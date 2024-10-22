@@ -18,7 +18,7 @@ from utils.sampler import SpacedSampler
 
 def parse_args() -> Namespace:
     parser = ArgumentParser()
-    parser.add_argument("--task", type=str, required=True, choices=["sr", "dn", "fr"])
+    parser.add_argument("--task", type=str, required=True, choices=["sr", "dn", "fr", "sr-v1", "fr-v1"])
     parser.add_argument("--upscale", type=float, required=True)
     ### input parameters
     parser.add_argument("-i", "--input", type=str, required=True, help="input image path")
@@ -56,17 +56,25 @@ def main():
     out_folder = Path(args.output)
     out_folder.mkdir(exist_ok=True, parents=True)
 
-    # Initialize stage1 model
+    # Initialize stage1 and stage2 model
     if args.task == "sr":
         model_stage1: RRDBNet = load_BSR(device)
-    elif args.task == "fr":
+        cldm, diffusion = load_stage2_models(device, version="v2")
+    elif args.task in "fr":
         model_stage1: SwinIR = load_BFR(device)
+        cldm, diffusion = load_stage2_models(device, version="v2")
     elif args.task == "dn":
         model_stage1: SCUNet = load_BID(device)
+        cldm, diffusion = load_stage2_models(device, version="v2")
+    elif args.task == "sr-v1":
+        model_stage1: SwinIR = load_BSR_v1(device)
+        cldm, diffusion = load_stage2_models(device, version="sr-v1")
+    elif args.task == "fr-v1":
+        model_stage1: SwinIR = load_BSR_v1(device)
+        cldm, diffusion = load_stage2_models(device, version="fr-v1")
     else:
         raise NotImplementedError()
-    # Initialize stage2 model
-    cldm, diffusion = load_stage2_models(device)
+    
     if args.guidance:
         cond_fn = init_cond_fn(args.g_loss, args.g_scale, args.g_start, args.g_stop,
                                args.g_space, args.g_repeat)
@@ -78,11 +86,11 @@ def main():
     lq = image_to_tensor(lq, device)
     # Run stage1
     if args.task == "sr":
-        clean = inference_BSR(model_stage1, lq)
-    elif args.task == "fr":
-        clean = inference_BFR(model_stage1, lq, size_hw=(H, W))
+        clean = inference_BSR(model_stage1, lq, size_hw=(H, W))
+    elif args.task in ["fr", "sr-v1", "fr-v1"]:
+        clean = inference_SwinIR(model_stage1, lq, size_hw=(H, W))
     elif args.task == "dn":
-        clean = inference_BID(model_stage1, lq, size_hw=(H, W))
+        clean = inference_SCUNet(model_stage1, lq, size_hw=(H, W))
     else:
         raise RuntimeError()
     print(f"stage1 output size: {(clean.shape[3], clean.shape[2])}")
@@ -116,15 +124,27 @@ MODELS = {
     "bsrnet": "https://github.com/cszn/KAIR/releases/download/v1.0/BSRNet.pth",
     "swinir_face": "https://huggingface.co/lxq007/DiffBIR/resolve/main/face_swinir_v1.ckpt",
     "scunet_psnr": "https://github.com/cszn/KAIR/releases/download/v1.0/scunet_color_real_psnr.pth",
+    "swinir_general": "https://huggingface.co/lxq007/DiffBIR/resolve/main/general_swinir_v1.ckpt",
+    "swinir_face": "https://huggingface.co/lxq007/DiffBIR/resolve/main/face_swinir_v1.ckpt",
     ### stage_2 model weights
     "sd_v21": "https://huggingface.co/stabilityai/stable-diffusion-2-1-base/resolve/main/v2-1_512-ema-pruned.ckpt",
-    "v2": "https://huggingface.co/lxq007/DiffBIR-v2/resolve/main/v2.pth"
+    "v2": "https://huggingface.co/lxq007/DiffBIR-v2/resolve/main/v2.pth",
+    "v1_face": "https://huggingface.co/lxq007/DiffBIR-v2/resolve/main/v1_face.pth",
+    "v1_general": "https://huggingface.co/lxq007/DiffBIR-v2/resolve/main/v1_general.pth",
 }
 
+### ==== Load stage1 model =====
 # utils/inference.py:BSRInferenceLoop:init_stage1_model
 def load_BSR(device) -> RRDBNet:
     model: RRDBNet = instantiate_from_config(OmegaConf.load("configs/inference/bsrnet.yaml"))
     weights = load_model_from_url(MODELS["bsrnet"])
+    model.load_state_dict(weights, strict=True)
+    model.eval().to(device)
+    return model
+
+def load_BSR_v1(device) -> RRDBNet:
+    model: SwinIR = instantiate_from_config(OmegaConf.load("configs/inference/swinir.yaml"))
+    weights = load_model_from_url(MODELS["swinir_general"])
     model.load_state_dict(weights, strict=True)
     model.eval().to(device)
     return model
@@ -143,29 +163,42 @@ def load_BID(device) -> SCUNet:
     model.eval().to(device)
     return model
 
-def inference_BSR(bsr_model: RRDBNet, lq: torch.Tensor) -> torch.Tensor:
+### ==== Run stage1 model =====
+def inference_BSR(bsr_model: RRDBNet, lq: torch.Tensor, size_hw: Tuple[int, int]) -> torch.Tensor:
     clean = bsr_model(lq)
+    # TODO: official code make sure the shortest side is at least 512. Why?
     return clean
 
-def inference_BFR(bfr_model: RRDBNet, lq: torch.Tensor, size_hw: Tuple[int, int]) -> torch.Tensor:
+def inference_SwinIR(swinir_model: SwinIR, lq: torch.Tensor, size_hw: Tuple[int, int]) -> torch.Tensor:
     lq = torch.nn.functional.interpolate(lq, size=size_hw)
-    clean = bfr_model(lq)
+    _, _, oh, ow = lq.shape
+    pad_lq = pad_to_multiples_of(lq, multiple=64)
+    clean = swinir_model(pad_lq)
+    clean = clean[:, :, :oh, :ow]
     return clean
 
-def inference_BID(bid_model: SCUNet, lq: torch.Tensor, size_hw: Tuple[int, int]) -> torch.Tensor:
+def inference_SCUNet(scunet_model: SCUNet, lq: torch.Tensor, size_hw: Tuple[int, int]) -> torch.Tensor:
     lq = torch.nn.functional.interpolate(lq, size=size_hw)
-    clean = bid_model(lq)
+    clean = scunet_model(lq)
     return clean
 
+### ==== Load stage2 model =====
 # utils/inference.py:InferenceLoop:init_stage2_model
-def load_stage2_models(device) -> Tuple[ControlLDM, Diffusion]:
+def load_stage2_models(device, version="v2") -> Tuple[ControlLDM, Diffusion]:
     cldm: ControlLDM = instantiate_from_config(OmegaConf.load("configs/inference/cldm.yaml"))
     weights = load_model_from_url(MODELS["sd_v21"])
     unused = cldm.load_pretrained_sd(weights)
     print(f"strictly load pretrained sd_v2.1, unused weights: {unused}")
     ### load controlnet
-    weights_control = load_model_from_url(MODELS["v2"])
-    cldm.load_controlnet_from_ckpt(weights_control)
+    if version == "v2":
+        weights_controlnet = load_model_from_url(MODELS["v2"])
+    elif version == "sr-v1":
+        weights_controlnet = load_model_from_url(MODELS["v1_general"])
+    elif version == "fr-v1":
+        weights_controlnet = load_model_from_url(MODELS["v1_general"])
+    else:
+        raise ValueError(f"Unknown version: {version}")
+    cldm.load_controlnet_from_ckpt(weights_controlnet)
     print(f"strictly load controlnet weight")
     cldm.eval().to(device)
     ### load diffusion
@@ -190,6 +223,7 @@ def init_cond_fn(g_loss: str, g_scale: float, g_start: int, g_stop: int, g_space
     )
     return cond_fn
 
+### ==== Run stage2 model =====
 # utils/helpers:Pipeline:run_stage2
 def inference_stage2(
     cldm: ControlLDM,
@@ -257,6 +291,7 @@ def inference_stage2(
     cldm.control_scales = old_control_scales
     return x
 
+### ==== Utility =====
 def bicubic_resize_to(img: np.ndarray, size_wh: Tuple[int, int] = None, scale: float = None) -> np.ndarray:
     pil = Image.fromarray(img)
     if size_wh is None:
